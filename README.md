@@ -18,7 +18,7 @@ For hot reload, run `npm run dev` alongside `npx wrangler pages dev dist` (Vite 
 ## Deploy
 
 ```sh
-npx wrangler pages secret put OPENAI_API_KEY --project-name jobforger
+./scripts/set-openai-key.sh   # paste key (hidden)
 npm run deploy
 ```
 
