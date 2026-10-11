@@ -20,6 +20,9 @@ const SECTIONS = {
   },
 }
 
+// NOT NULL columns in D1
+const REQUIRED = ['role', 'company', 'degree', 'institution', 'name', 'start_date']
+
 const parseList = (v) => { try { return JSON.parse(v) || [] } catch { return v ? [v] : [] } }
 
 function Entry({ table, item, onSaved, onCancel }) {
@@ -42,7 +45,7 @@ function Entry({ table, item, onSaved, onCancel }) {
         <label key={k} className={type ? 'full' : ''}>
           {label}
           {type ? <textarea rows={4} value={form[k] || ''} onChange={(e) => setForm({ ...form, [k]: e.target.value })} />
-            : <input value={form[k] || ''} onChange={(e) => setForm({ ...form, [k]: e.target.value })} required={k === fields[0][0]} />}
+            : <input value={form[k] || ''} onChange={(e) => setForm({ ...form, [k]: e.target.value })} required={REQUIRED.includes(k)} />}
         </label>
       ))}
       <div className="row between full">

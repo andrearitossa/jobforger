@@ -56,6 +56,8 @@ async function startSession(c, userId) {
 }
 
 app.use('*', async (c, next) => {
+  // Without a secret every session would be forgeable, so refuse to serve at all.
+  if (!c.env.SESSION_SECRET) return c.json({ error: 'Server misconfigured: SESSION_SECRET is not set' }, 500)
   const [id, exp, sig] = (getCookie(c, 'session') || '').split('.')
   if (sig && +exp > now() && sig === (await sign(`${id}.${exp}`, c.env.SESSION_SECRET))) c.set('userId', id)
   if (!c.get('userId') && !c.req.path.startsWith('/api/auth/')) return c.json({ error: 'Unauthorized' }, 401)
