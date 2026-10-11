@@ -2,50 +2,16 @@ import { useEffect, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { api, STATUSES } from '../api'
 
-function DocPicker({ kind, label, app, docs, update, reload }) {
-  const field = kind === 'cvs' ? 'cv_id' : 'cover_letter_id'
-  const [busy, setBusy] = useState(false)
-  const generate = async () => {
-    setBusy(true)
-    try { await api(`/ai/generate/${app.id}`, { method: 'POST', body: { kind } }); await reload() }
-    catch (err) { alert(err.message) } finally { setBusy(false) }
-  }
+function DocPicker({ kind, label, value, docs, appId, onChange }) {
   return (
     <div className="stack tight">
       <label>{label}</label>
       <div className="row">
-        <select value={app[field] || ''} onChange={(e) => update({ [field]: e.target.value })}>
-          <option value="">None</option>
+        <select className="grow" value={value || ''} onChange={(e) => onChange(e.target.value)}>
+          <option value="">None — ask Copilot to tailor one</option>
           {docs.map((d) => <option key={d.id} value={d.id}>{d.name}</option>)}
         </select>
-        {app[field] && <Link className="button" to={`/${kind}/${app[field]}?app=${app.id}`}>Open</Link>}
-        <button onClick={generate} disabled={busy}>{busy ? 'Writing…' : 'Tailor with AI'}</button>
-      </div>
-    </div>
-  )
-}
-
-function Question({ q, appId, reload }) {
-  const [answer, setAnswer] = useState(q.answer || '')
-  const [busy, setBusy] = useState(false)
-  useEffect(() => setAnswer(q.answer || ''), [q.answer])
-  const path = `/applications/${appId}/questions/${q.id}`
-  const draft = async () => {
-    setBusy(true)
-    try { await api(`/ai/answer/${appId}/${q.id}`, { method: 'POST' }); await reload() }
-    catch (err) { alert(err.message) } finally { setBusy(false) }
-  }
-  return (
-    <div className="card stack tight">
-      <div className="row between">
-        <strong>{q.question}</strong>
-        <button className="ghost small" onClick={async () => { await api(path, { method: 'DELETE' }); reload() }}>Remove</button>
-      </div>
-      <textarea rows={4} value={answer} onChange={(e) => setAnswer(e.target.value)}
-        onBlur={() => answer !== (q.answer || '') && api(path, { method: 'PUT', body: { answer } })} />
-      <div className="row end">
-        <button onClick={() => navigator.clipboard.writeText(answer)} disabled={!answer} className="ghost">Copy</button>
-        <button onClick={draft} disabled={busy}>{busy ? 'Drafting…' : 'Draft with AI'}</button>
+        {value && <Link className="button" to={`/${kind}/${value}?app=${appId}`}>Open</Link>}
       </div>
     </div>
   )
@@ -56,7 +22,6 @@ export default function Application() {
   const navigate = useNavigate()
   const [app, setApp] = useState(null)
   const [docs, setDocs] = useState({ cvs: [], 'cover-letters': [] })
-  const [question, setQuestion] = useState('')
 
   const reload = async () => {
     const [a, cvs, cls] = await Promise.all([api(`/applications/${id}`), api('/docs/cvs'), api('/docs/cover-letters')])
@@ -64,6 +29,10 @@ export default function Application() {
     setDocs({ cvs, 'cover-letters': cls })
   }
   useEffect(() => { reload() }, [id])
+  useEffect(() => {
+    window.addEventListener('copilot:action', reload)
+    return () => window.removeEventListener('copilot:action', reload)
+  }, [id])
   if (!app) return null
 
   const update = async (patch) => {
@@ -72,13 +41,7 @@ export default function Application() {
   }
   const field = (k, props = {}) => {
     const Tag = props.rows ? 'textarea' : 'input'
-    return <Tag {...props} defaultValue={app[k] || ''} onBlur={(e) => e.target.value !== (app[k] || '') && update({ [k]: e.target.value })} />
-  }
-  const addQuestion = async (e) => {
-    e.preventDefault()
-    await api(`/applications/${id}/questions`, { method: 'POST', body: { question } })
-    setQuestion('')
-    reload()
+    return <Tag key={`${k}:${app[k]}`} {...props} defaultValue={app[k] || ''} onBlur={(e) => e.target.value !== (app[k] || '') && update({ [k]: e.target.value })} />
   }
   const remove = async () => {
     if (!confirm('Delete this application?')) return
@@ -106,25 +69,15 @@ export default function Application() {
             <div className="stack tight grow"><label>Position</label>{field('position')}</div>
           </div>
           <div className="stack tight"><label>Job URL</label>{field('job_url')}</div>
-          <div className="stack tight"><label>Job description</label>{field('job_description', { rows: 12 })}</div>
+          <div className="stack tight"><label>Job description</label>{field('job_description', { rows: 14 })}</div>
         </div>
         <div className="stack">
-          <DocPicker kind="cvs" label="CV" app={app} docs={docs.cvs} update={update} reload={reload} />
-          <DocPicker kind="cover-letters" label="Cover letter" app={app} docs={docs['cover-letters']} update={update} reload={reload} />
-          <div className="stack tight"><label>Notes</label>{field('notes', { rows: 6 })}</div>
+          <DocPicker kind="cvs" label="CV" value={app.cv_id} docs={docs.cvs} appId={id} onChange={(v) => update({ cv_id: v })} />
+          <DocPicker kind="cover-letters" label="Cover letter" value={app.cover_letter_id} docs={docs['cover-letters']} appId={id} onChange={(v) => update({ cover_letter_id: v })} />
+          <div className="stack tight"><label>Notes</label>{field('notes', { rows: 8 })}</div>
+          <div><button className="ghost danger small" onClick={remove}>Delete application</button></div>
         </div>
       </section>
-
-      <section className="stack">
-        <h2>Application questions</h2>
-        {app.questions.map((q) => <Question key={q.id} q={q} appId={id} reload={reload} />)}
-        <form className="row" onSubmit={addQuestion}>
-          <input placeholder="e.g. Why do you want to work here?" value={question} onChange={(e) => setQuestion(e.target.value)} required />
-          <button>Add question</button>
-        </form>
-      </section>
-
-      <div><button className="ghost danger" onClick={remove}>Delete application</button></div>
     </div>
   )
 }

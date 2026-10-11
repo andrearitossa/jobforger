@@ -8,17 +8,25 @@ import Application from './pages/Application'
 import Docs from './pages/Docs'
 import DocEditor from './pages/DocEditor'
 import Profile from './pages/Profile'
+import Copilot from './Copilot'
 import './styles.css'
 
 function Shell({ user, setUser, children }) {
   const navigate = useNavigate()
+  const [copilot, setCopilot] = useState(() => { try { return localStorage.getItem('copilot:open') !== '0' } catch { return true } })
+  useEffect(() => { try { localStorage.setItem('copilot:open', copilot ? '1' : '0') } catch {} }, [copilot])
+  useEffect(() => {
+    const onKey = (e) => { if ((e.ctrlKey || e.metaKey) && e.key === 'k') { e.preventDefault(); setCopilot((o) => !o) } }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
   const logout = async () => {
     await api('/auth/logout', { method: 'POST' })
     setUser(null)
     navigate('/login')
   }
   return (
-    <>
+    <div className={copilot ? 'with-copilot' : ''}>
       <header className="topbar">
         <NavLink to="/" className="brand">jobforger</NavLink>
         <nav>
@@ -28,9 +36,11 @@ function Shell({ user, setUser, children }) {
           <NavLink to="/profile">Profile</NavLink>
         </nav>
         <button className="ghost" onClick={logout} title={user.email}>Sign out</button>
+        <button className={`copilot-toggle ${copilot ? 'on' : ''}`} onClick={() => setCopilot(!copilot)} title="Ctrl+K">✦ Copilot</button>
       </header>
       <main>{children}</main>
-    </>
+      <Copilot user={user} open={copilot} onClose={() => setCopilot(false)} />
+    </div>
   )
 }
 

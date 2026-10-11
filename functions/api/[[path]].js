@@ -246,9 +246,7 @@ app.get('/applications', async (c) => {
 })
 
 async function loadApplication(db, userId, id) {
-  const app = await db.prepare('SELECT * FROM applications WHERE id = ? AND user_id = ?').bind(id, userId).first()
-  if (app) app.questions = (await db.prepare('SELECT * FROM application_questions WHERE application_id = ? ORDER BY created_at').bind(id).all()).results
-  return app
+  return db.prepare('SELECT * FROM applications WHERE id = ? AND user_id = ?').bind(id, userId).first()
 }
 
 app.get('/applications/:id', async (c) => {
@@ -281,29 +279,6 @@ app.delete('/applications/:id', async (c) => {
   return c.json({ ok: true })
 })
 
-app.post('/applications/:id/questions', async (c) => {
-  const a = await loadApplication(c.env.DB, c.get('userId'), c.req.param('id'))
-  if (!a) return c.notFound()
-  const { question } = await c.req.json()
-  await c.env.DB.prepare('INSERT INTO application_questions (id, application_id, question, created_at) VALUES (?, ?, ?, ?)')
-    .bind(uid(), a.id, question, now()).run()
-  return c.json({ ok: true })
-})
-
-app.put('/applications/:id/questions/:qid', async (c) => {
-  const { answer } = await c.req.json()
-  await c.env.DB.prepare(
-    'UPDATE application_questions SET answer = ?, ai_generated = 0 WHERE id = ? AND application_id IN (SELECT id FROM applications WHERE user_id = ?)',
-  ).bind(answer, c.req.param('qid'), c.get('userId')).run()
-  return c.json({ ok: true })
-})
-
-app.delete('/applications/:id/questions/:qid', async (c) => {
-  await c.env.DB.prepare('DELETE FROM application_questions WHERE id = ? AND application_id IN (SELECT id FROM applications WHERE user_id = ?)')
-    .bind(c.req.param('qid'), c.get('userId')).run()
-  return c.json({ ok: true })
-})
-
 // ---------- AI ----------
 
 async function ai(env, system, user) {
@@ -333,40 +308,166 @@ app.post('/ai/parse-job', async (c) => {
     text))
 })
 
-app.post('/ai/edit/:kind/:id', async (c) => {
-  const t = KINDS[c.req.param('kind')]
-  const doc = t && (await c.env.DB.prepare(`SELECT * FROM ${t} WHERE id = ? AND user_id = ?`).bind(c.req.param('id'), c.get('userId')).first())
-  if (!doc) return c.notFound()
-  const { message, applicationId } = await c.req.json()
-  const job = applicationId && (await loadApplication(c.env.DB, c.get('userId'), applicationId))
-  const out = await ai(c.env,
-    `You edit LaTeX ${t === 'cvs' ? 'CVs' : 'cover letters'}. Apply the user's request to the document. Keep it compilable with pdflatex and standard packages, and never invent facts beyond the candidate profile. Return {"latex": the full updated document, "reply": one or two sentences on what changed}.`,
-    `Candidate profile:\n${profileText(await loadProfile(c.env.DB, c.get('userId')))}\n\n${job ? `Target job:\n${jobText(job)}\n\n` : ''}Current document:\n${doc.latex_content}\n\nRequest: ${message}`)
-  return c.json(out)
-})
+// ---------- copilot ----------
 
-app.post('/ai/generate/:applicationId', async (c) => {
-  const kind = (await c.req.json()).kind
-  const a = await loadApplication(c.env.DB, c.get('userId'), c.req.param('applicationId'))
-  if (!a || !KINDS[kind]) return c.notFound()
-  const what = kind === 'cvs' ? 'a one-page CV' : 'a cover letter'
-  const { latex } = await ai(c.env,
-    `Write ${what} in LaTeX tailored to the target job, using only facts from the candidate profile. Use this template's structure and packages:\n${TEMPLATES[kind]}\nReturn {"latex": the full document}.`,
-    `Candidate profile:\n${profileText(await loadProfile(c.env.DB, c.get('userId')))}\n\nTarget job:\n${jobText(a)}`)
-  const id = await createDoc(c.env.DB, c.get('userId'), kind, `${a.company} – ${a.position}`, latex)
-  await c.env.DB.prepare(`UPDATE applications SET ${kind === 'cvs' ? 'cv_id' : 'cover_letter_id'} = ? WHERE id = ?`).bind(id, a.id).run()
-  return c.json({ id })
-})
+const TOOLS = [
+  {
+    name: 'edit_document',
+    description: 'Edit an existing CV or cover letter by exact find-and-replace. Each "find" must be copied verbatim from the current LaTeX and be unique; keep edits small and targeted.',
+    parameters: {
+      kind: { type: 'string', enum: ['cvs', 'cover-letters'] },
+      id: { type: 'string' },
+      edits: { type: 'array', items: { type: 'object', properties: { find: { type: 'string' }, replace: { type: 'string' } }, required: ['find', 'replace'] } },
+    },
+    required: ['kind', 'id', 'edits'],
+  },
+  {
+    name: 'create_document',
+    description: 'Create a new CV or cover letter (e.g. tailored to an application). Optionally attach it to an application.',
+    parameters: { kind: { type: 'string', enum: ['cvs', 'cover-letters'] }, name: { type: 'string' }, latex: { type: 'string' }, application_id: { type: 'string' } },
+    required: ['kind', 'name', 'latex'],
+  },
+  {
+    name: 'update_application',
+    description: 'Update fields of a job application.',
+    parameters: { id: { type: 'string' }, status: { type: 'string', enum: ['wishlist', 'applied', 'interview', 'offer', 'rejected'] }, notes: { type: 'string' }, cv_id: { type: 'string' }, cover_letter_id: { type: 'string' } },
+    required: ['id'],
+  },
+].map(({ name, description, parameters, required }) => ({ type: 'function', name, description, parameters: { type: 'object', properties: parameters, required } }))
 
-app.post('/ai/answer/:applicationId/:qid', async (c) => {
-  const a = await loadApplication(c.env.DB, c.get('userId'), c.req.param('applicationId'))
-  const q = a?.questions.find((q) => q.id === c.req.param('qid'))
-  if (!q) return c.notFound()
-  const { answer } = await ai(c.env,
-    'Answer this job application question in the first person as the candidate: concise, specific, honest, grounded only in the profile. Return {"answer": string}.',
-    `Candidate profile:\n${profileText(await loadProfile(c.env.DB, c.get('userId')))}\n\nTarget job:\n${jobText(a)}\n\nQuestion: ${q.question}`)
-  await c.env.DB.prepare('UPDATE application_questions SET answer = ?, ai_generated = 1 WHERE id = ?').bind(answer, q.id).run()
-  return c.json({ answer })
+// Runs a tool call for the user and returns [result for the model, event for the UI].
+async function runTool(db, userId, name, args) {
+  if (name === 'edit_document') {
+    const t = KINDS[args.kind]
+    const doc = t && (await db.prepare(`SELECT name, latex_content FROM ${t} WHERE id = ? AND user_id = ?`).bind(args.id, userId).first())
+    if (!doc) return ['Document not found']
+    let latex = doc.latex_content
+    for (const { find, replace } of args.edits || []) {
+      const n = latex.split(find).length - 1
+      if (n !== 1) return [`Edit failed: "${find.slice(0, 80)}" matched ${n} times. Nothing was saved; copy the text exactly and make it unique.`]
+      latex = latex.replace(find, () => replace)
+    }
+    await db.prepare(`UPDATE ${t} SET latex_content = ?, updated_at = ? WHERE id = ?`).bind(latex, now(), args.id).run()
+    const n = args.edits.length
+    return ['Saved', { type: 'doc', kind: args.kind, id: args.id, label: `Edited ${doc.name} · ${n} change${n > 1 ? 's' : ''}` }]
+  }
+  if (name === 'create_document') {
+    if (!KINDS[args.kind]) return ['Unknown kind']
+    const id = await createDoc(db, userId, args.kind, args.name, args.latex)
+    if (args.application_id && (await loadApplication(db, userId, args.application_id))) {
+      await db.prepare(`UPDATE applications SET ${args.kind === 'cvs' ? 'cv_id' : 'cover_letter_id'} = ? WHERE id = ?`).bind(id, args.application_id).run()
+    }
+    return [`Created with id ${id}`, { type: 'doc', kind: args.kind, id, label: `Created ${args.name}`, created: true }]
+  }
+  if (name === 'update_application') {
+    const a = await loadApplication(db, userId, args.id)
+    if (!a) return ['Application not found']
+    const fields = ['status', 'notes', 'cv_id', 'cover_letter_id'].filter((f) => args[f] !== undefined)
+    if (args.status === 'applied' && !a.applied_at) (args.applied_at = now()), fields.push('applied_at')
+    if (fields.length) await db.prepare(`UPDATE applications SET ${fields.map((f) => `${f} = ?`).join(', ')} WHERE id = ?`).bind(...fields.map((f) => args[f]), a.id).run()
+    return ['Saved', { type: 'application', id: a.id, label: `Updated ${a.company} application` }]
+  }
+  return ['Unknown tool']
+}
+
+async function copilotContext(db, userId, page) {
+  const [profile, cvs, cls, apps] = await Promise.all([
+    loadProfile(db, userId),
+    db.prepare('SELECT id, name FROM cvs WHERE user_id = ? ORDER BY updated_at DESC').bind(userId).all(),
+    db.prepare('SELECT id, name FROM cover_letters WHERE user_id = ? ORDER BY updated_at DESC').bind(userId).all(),
+    db.prepare('SELECT id, company, position, status, cv_id, cover_letter_id FROM applications WHERE user_id = ? ORDER BY created_at DESC').bind(userId).all(),
+  ])
+  const parts = [
+    `Today is ${new Date().toISOString().slice(0, 10)}.`,
+    `## Candidate profile\n${profileText(profile)}`,
+    `## CVs\n${JSON.stringify(cvs.results)}`,
+    `## Cover letters\n${JSON.stringify(cls.results)}`,
+    `## Applications\n${JSON.stringify(apps.results)}`,
+  ]
+  const docText = async (kind, id) => {
+    const d = id && KINDS[kind] && (await db.prepare(`SELECT id, name, latex_content FROM ${KINDS[kind]} WHERE id = ? AND user_id = ?`).bind(id, userId).first())
+    return d ? `### ${kind === 'cvs' ? 'CV' : 'Cover letter'} "${d.name}" (kind: ${kind}, id: ${d.id})\n${d.latex_content}` : ''
+  }
+  let appId = page?.applicationId
+  // A document opened from the documents list still belongs to the job it's attached to.
+  if (page?.docId && !appId && KINDS[page.kind]) {
+    appId = (await db.prepare(`SELECT id FROM applications WHERE user_id = ? AND ${page.kind === 'cvs' ? 'cv_id' : 'cover_letter_id'} = ? ORDER BY created_at DESC`).bind(userId, page.docId).first())?.id
+  }
+  if (page?.docId) parts.push(`## The user is viewing this document\n${await docText(page.kind, page.docId)}`)
+  if (appId) {
+    const a = await loadApplication(db, userId, appId)
+    if (a) {
+      parts.push(`## ${page.docId ? 'This document is for' : 'The user is viewing'} this application (id: ${a.id})\n${jobText(a)}\nStatus: ${a.status}\nNotes: ${a.notes || ''}`)
+      if (!page?.docId) parts.push(await docText('cvs', a.cv_id), await docText('cover-letters', a.cover_letter_id))
+    }
+  }
+  return parts.filter(Boolean).join('\n\n')
+}
+
+const COPILOT_PROMPT = `You are Jobforger's copilot: a sharp, warm career coach and LaTeX expert helping the user land jobs.
+You see their profile, documents and applications below, plus what they are looking at right now.
+- Be brief and direct, like a great colleague in chat. Short paragraphs or bullets; no preamble.
+- When the user asks to change a document, act immediately with edit_document (small exact find/replace edits), then say in one line what changed. Don't paste LaTeX into chat or ask for confirmation.
+- To tailor a CV or cover letter to a job, call create_document (attach it via application_id) unless they want the current one edited.
+- Never invent experience, employers, dates, numbers or skills that aren't in the profile or documents. If something is missing, ask.
+- For application questions or emails, write the text directly in chat, ready to copy.`
+
+app.post('/chat', async (c) => {
+  if (!c.env.OPENAI_API_KEY) return c.json({ error: 'OPENAI_API_KEY is not configured' }, 500)
+  const { messages = [], page } = await c.req.json()
+  const userId = c.get('userId')
+  const instructions = `${COPILOT_PROMPT}\n\n${await copilotContext(c.env.DB, userId, page)}`
+  let input = messages.slice(-20).map(({ role, content }) => ({ role: role === 'user' ? 'user' : 'assistant', content: String(content) }))
+  let previous
+  const { readable, writable } = new TransformStream()
+  const writer = writable.getWriter()
+  const send = (obj) => writer.write(enc.encode(`data: ${JSON.stringify(obj)}\n\n`))
+
+  // OpenAI Responses API: stream text, run any tool calls, then continue from the previous response.
+  c.executionCtx.waitUntil((async () => {
+    try {
+      for (let round = 0; round < 4; round++) {
+        const res = await fetch('https://api.openai.com/v1/responses', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${c.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: c.env.OPENAI_MODEL || 'gpt-6-luna', instructions, input, tools: TOOLS, stream: true, previous_response_id: previous, reasoning: { effort: 'none' } }),
+        })
+        if (!res.ok) throw new Error(`OpenAI error: ${(await res.text()).slice(0, 300)}`)
+        const calls = []
+        const reader = res.body.pipeThrough(new TextDecoderStream()).getReader()
+        let buf = ''
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buf += value
+          const lines = buf.split('\n')
+          buf = lines.pop()
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue
+            const ev = JSON.parse(line.slice(6))
+            if (ev.type === 'response.output_text.delta') send({ t: 'text', v: ev.delta })
+            else if (ev.type === 'response.output_item.added' && ev.item.type === 'function_call') send({ t: 'working', v: ev.item.name })
+            else if (ev.type === 'response.output_item.done' && ev.item.type === 'function_call') calls.push(ev.item)
+            else if (ev.type === 'response.completed') previous = ev.response.id
+            else if (ev.type === 'response.failed' || ev.type === 'error') throw new Error(ev.response?.error?.message || ev.message || 'OpenAI request failed')
+          }
+        }
+        if (!calls.length) break
+        input = []
+        for (const k of calls) {
+          let result, event
+          try { [result, event] = await runTool(c.env.DB, userId, k.name, JSON.parse(k.arguments || '{}')) } catch (err) { result = `Error: ${err.message}` }
+          if (event) send({ t: 'action', ...event })
+          input.push({ type: 'function_call_output', call_id: k.call_id, output: result })
+        }
+      }
+    } catch (err) {
+      send({ t: 'error', v: err.message })
+    }
+    await writer.close()
+  })())
+
+  return new Response(readable, { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' } })
 })
 
 // ---------- templates ----------
