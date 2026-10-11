@@ -1,0 +1,12 @@
+name = "jobforger"
+pages_build_output_dir = "dist"
+compatibility_date = "2024-12-01"
+
+[vars]
+OPENAI_MODEL = "gpt-6-luna"
+LATEX_COMPILE_URL = "https://latex.ytotech.com/builds/sync"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "jobforger-db"
+database_id = "b8ed86e9-b246-408e-bd25-127bbdd135c3"
